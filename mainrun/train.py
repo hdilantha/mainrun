@@ -16,7 +16,7 @@ import structlog
 class Hyperparameters:
     block_size: int = 128
     batch_size: int = 64
-    vocab_size: int = 32_000
+    vocab_size: int = 32_000 #CHANGED
     n_layer: int = 6
     n_head: int = 8
     d_model: int = 512
@@ -262,7 +262,8 @@ def main():
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log("model_info", parameters_count=model_params)
     
-    opt = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # opt = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)  # CHANGED
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
 
     def evaluate():
