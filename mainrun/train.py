@@ -24,8 +24,8 @@ class Hyperparameters:
     d_model: int = 512
     dropout: float = 0.1
     # lr: float = 6e-3
-    # lr: float = 1e-3 # CHANGED
-    lr: float = 5e-4 # CHANGED 2
+    lr: float = 1e-3 # CHANGED
+    # lr: float = 5e-4 # CHANGED 2
     # weight_decay: float = 0.00
     weight_decay: float = 0.01 # CHANGED
     evals_per_epoch: int = 3
@@ -247,6 +247,11 @@ def main():
     
     batches = len(train_ids) // (args.block_size * args.batch_size)
     max_steps = args.epochs * batches
+    # Changed
+    total_steps = max_steps
+    warmup_steps = int(0.1 * total_steps)
+    base_lr = args.lr
+    #
     eval_interval = batches // args.evals_per_epoch
     logger.log("dataset_info",
                titles_count=len(train_titles),
@@ -295,7 +300,17 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            scheduler.step()
+            # scheduler.step()
+            # CHANGED
+            if step < warmup_steps:
+                lr = base_lr * (step + 1) / warmup_steps  # +1 to avoid lr=0 at step=0
+            else:
+                # After warmup, keep lr constant or decay as you wish
+                lr = base_lr  # Or apply any decay formula you want
+
+            for param_group in opt.param_groups:
+                param_group['lr'] = lr
+            #
 
             elapsed = time.time() - t0
             logger.log("training_step",
