@@ -15,8 +15,7 @@ import structlog
 @dataclass
 class Hyperparameters:
     # block_size: int = 128
-    # block_size: int = 256 # CHANGED
-    block_size: int = 512 # CHANGED
+    block_size: int = 256 # CHANGED
     batch_size: int = 64
     # vocab_size: int = 16_000
     vocab_size: int = 32_000 # CHANGED
@@ -248,6 +247,11 @@ def main():
     
     batches = len(train_ids) // (args.block_size * args.batch_size)
     max_steps = args.epochs * batches
+    # Changed
+    total_steps = max_steps
+    warmup_steps = int(0.2 * total_steps)
+    base_lr = args.lr
+    #
     eval_interval = batches // args.evals_per_epoch
     logger.log("dataset_info",
                titles_count=len(train_titles),
@@ -296,7 +300,17 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            scheduler.step()
+            # scheduler.step()
+            # CHANGED
+            if step < warmup_steps:
+                lr = base_lr * (step + 1) / warmup_steps  # +1 to avoid lr=0 at step=0
+            else:
+                # After warmup, keep lr constant or decay as you wish
+                lr = base_lr  # Or apply any decay formula you want
+
+            for param_group in opt.param_groups:
+                param_group['lr'] = lr
+            #
 
             elapsed = time.time() - t0
             logger.log("training_step",
