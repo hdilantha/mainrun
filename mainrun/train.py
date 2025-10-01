@@ -24,7 +24,8 @@ class Hyperparameters:
     d_model: int = 512
     dropout: float = 0.1
     # lr: float = 6e-3
-    lr: float = 1e-3 # CHANGED
+    # lr: float = 1e-3 # CHANGED
+    lr: float = 5e-4 # CHANGED 2
     # weight_decay: float = 0.00
     weight_decay: float = 0.01 # CHANGED
     evals_per_epoch: int = 3
