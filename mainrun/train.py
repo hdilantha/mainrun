@@ -270,7 +270,7 @@ def main():
     # opt = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay) # CHANGED
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_max=max_steps) # CHANGED
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=batches, T_mult=2) # CHANGED
 
     def evaluate():
         model.eval()
