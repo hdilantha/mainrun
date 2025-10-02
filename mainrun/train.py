@@ -163,22 +163,27 @@ def iter_full_split(split_ids: torch.Tensor, block_size: int, batch_size: int, d
 #     @property
 #     def vocab_size(self): return self.tk.get_vocab_size()
 
-def train_sentencepiece(titles: list[str], vocab_size: int,
-                        model_prefix: str) -> str:
-    import os
+def train_sentencepiece(titles: list[str], vocab_size: int, model_prefix: str) -> str:
+    import os, sentencepiece as spm
     os.makedirs(os.path.dirname(model_prefix), exist_ok=True)
     tmp_txt = f"{model_prefix}.train.txt"
     with open(tmp_txt, "w", encoding="utf-8") as f:
         for t in titles:
-            tt = preprocess_title((t or "").strip())
+            tt = (t or "").strip()
             if tt:
                 f.write(tt + "\n")
 
-    # Domain/user-defined tokens that frequently appear in HN titles
+    # URL/techy fragments commonly found in HN titles.
+    # (No spaces; these match verbatim substrings in your raw data.)
     user_syms = (
-        "<eos>", "<pad>", "<ASK>", "<SHOW>", "<TELL>", "<URL>",
-        "C++", "C#", "API", "HTTP", "HTTPS", "SQL", "NoSQL",
-        "GPU", "CLI", "macOS", "iOS", "YC", "GPT-4", "GPT-4o"
+        "<eos>", "<pad>",
+        "http", "https", "://", "www.", ".com", ".org", ".io",
+        ".dev", ".ai", ".net", ".gg",
+        "C++", "C#", "API", "SDK", "GPU", "CLI",
+        "HTTP", "HTTPS", "SQL", "NoSQL",
+        "macOS", "iOS", "Android", "Linux", "Unix",
+        "RFC", "YC", "OSS",
+        "GPT-4", "GPT-4o", "LLM", "AI"
     )
 
     spm.SentencePieceTrainer.train(
@@ -187,15 +192,15 @@ def train_sentencepiece(titles: list[str], vocab_size: int,
         model_type="unigram",
         vocab_size=vocab_size,
         character_coverage=1.0,
-        normalization_rule_name="nfkc",
+        normalization_rule_name="nfkc",  # safe normalization, not augmentation
         byte_fallback=True,
         remove_extra_whitespaces=True,
-        split_by_number=False,          # keep 2024 / versions tighter
+        split_by_number=False,           # keep 2024 / 1.2.3 tighter
         hard_vocab_limit=False,
         user_defined_symbols=",".join(user_syms),
-        input_sentence_size=4000000,    # sample plenty
+        input_sentence_size=4000000,
         shuffle_input_sentence=True,
-        num_threads=0                   # use all cores
+        num_threads=0
     )
     return f"{model_prefix}.model"
 
@@ -210,18 +215,9 @@ class SPMTokenizer:
         self.eos_id = self.sp.piece_to_id("<eos>")
         assert self.eos_id != self.sp.unk_id(), "<eos> must be in vocab"
 
-    def encode_ids(self, text: str, sampling: bool = False, alpha: float = 0.1, nbest: int = -1) -> list[int]:
-        if sampling:
-            return self.sp.encode(text, out_type=int, enable_sampling=True, alpha=alpha, nbest_size=nbest)
-        else:
-            return self.sp.encode(text, out_type=int)
-
-    def decode(self, ids: list[int]) -> str:
-        return self.sp.decode(ids)
-
-    @property
-    def vocab_size(self) -> int:
-        return self.sp.get_piece_size()
+    def encode_ids(self, text: str) -> list[int]:
+        # Deterministic; no augmentation
+        return self.sp.encode(text, out_type=int)
 
 
 def encode_titles_to_flat_ids(titles: list[str], tok: SPMTokenizer,
@@ -357,9 +353,10 @@ def main():
 
     tok = SPMTokenizer(spm_model_path)
 
-    # Train = sampling on (subword regularization); Val = deterministic
-    train_ids = encode_titles_to_flat_ids(train_titles, tok, sampling=True,  alpha=0.1)
-    val_ids   = encode_titles_to_flat_ids(val_titles,   tok, sampling=False, alpha=0.0)
+    train_text = eos_token.join(train_titles) + eos_token
+    val_text   = eos_token.join(val_titles) + eos_token
+    train_ids  = torch.tensor(tok.encode_ids(train_text), dtype=torch.long)
+    val_ids    = torch.tensor(tok.encode_ids(val_text),   dtype=torch.long)
 
     batches = len(train_ids) // (args.block_size * args.batch_size)
     max_steps = args.epochs * batches
