@@ -8,9 +8,13 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from datasets import load_dataset
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+# from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 from tqdm import tqdm
 import structlog
+
+import sentencepiece as spm
+import os
+
 
 @dataclass
 class Hyperparameters:
@@ -104,31 +108,82 @@ def iter_full_split(split_ids: torch.Tensor, block_size: int, batch_size: int, d
         y = batch[1:].view(batch_size, block_size).to(device)
         yield x, y
 
-def train_tokenizer(titles: list[str], vocab_size: int, unk_token: str = "<unk>", pad_token: str = "<pad>", eos_token: str = "<eos>") -> Tokenizer:
-    tokenizer = Tokenizer(models.BPE(unk_token=unk_token))
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
-    tokenizer.decoder = decoders.ByteLevel()
-    trainer = trainers.BpeTrainer(
-        vocab_size=vocab_size,
-        special_tokens=[pad_token, eos_token, unk_token]
-    )
-    tokenizer.train_from_iterator(titles, trainer)
-    return tokenizer
+# def train_tokenizer(titles: list[str], vocab_size: int, unk_token: str = "<unk>", pad_token: str = "<pad>", eos_token: str = "<eos>") -> Tokenizer:
+#     tokenizer = Tokenizer(models.BPE(unk_token=unk_token))
+#     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
+#     tokenizer.decoder = decoders.ByteLevel()
+#     trainer = trainers.BpeTrainer(
+#         vocab_size=vocab_size,
+#         special_tokens=[pad_token, eos_token, unk_token]
+#     )
+#     tokenizer.train_from_iterator(titles, trainer)
+#     return tokenizer
 
-class BPETokenizer:
-    def __init__(self, tokenizer: Tokenizer):
-        self.tk = tokenizer
-        self.stoi = {tok: i for tok, i in tokenizer.get_vocab().items()}
-        self.itos = {i: tok for tok, i in tokenizer.get_vocab().items()}
+# class BPETokenizer:
+#     def __init__(self, tokenizer: Tokenizer):
+#         self.tk = tokenizer
+#         self.stoi = {tok: i for tok, i in tokenizer.get_vocab().items()}
+#         self.itos = {i: tok for tok, i in tokenizer.get_vocab().items()}
+
+#     def encode(self, s: str) -> list[int]:
+#         return self.tk.encode(s).ids
+
+#     def decode(self, ids: list[int]) -> str:
+#         return self.tk.decode(ids, skip_special_tokens=True)
+
+#     @property
+#     def vocab_size(self): return self.tk.get_vocab_size()
+
+def train_sentencepiece(titles: list[str], vocab_size: int,
+                        model_prefix: str,
+                        user_symbols: tuple[str, ...] = ("<eos>", "<pad>")) -> str:
+    """
+    Trains a SentencePiece Unigram model on the given titles and writes
+    {model_prefix}.model / {model_prefix}.vocab. Returns the .model path.
+    """
+    os.makedirs(os.path.dirname(model_prefix), exist_ok=True)
+    tmp_txt = f"{model_prefix}.train.txt"
+    with open(tmp_txt, "w", encoding="utf-8") as f:
+        for t in titles:
+            t = (t or "").strip()
+            if t:
+                f.write(t + "\n")
+
+    spm.SentencePieceTrainer.train(
+        input=tmp_txt,
+        model_prefix=model_prefix,
+        model_type="unigram",
+        vocab_size=vocab_size,
+        character_coverage=1.0,
+        normalization_rule_name="nfkc",
+        byte_fallback=True,
+        remove_extra_whitespaces=True,
+        split_by_number=False,
+        user_defined_symbols=",".join(user_symbols),
+        hard_vocab_limit=False,  # don’t fail if user symbols push over vocab
+    )
+    return f"{model_prefix}.model"
+
+
+class SPMTokenizer:
+    """Minimal wrapper to match your BPETokenizer interface (encode/decode/vocab_size)."""
+    def __init__(self, model_file: str):
+        self.sp = spm.SentencePieceProcessor()
+        ok = self.sp.load(model_file)
+        if not ok:
+            raise RuntimeError(f"Failed to load SentencePiece model: {model_file}")
 
     def encode(self, s: str) -> list[int]:
-        return self.tk.encode(s).ids
+        # You already insert the literal "<eos>" string in your data;
+        # we included "<eos>" as a user-defined symbol so it is 1 token.
+        return self.sp.encode(s, out_type=int)
 
     def decode(self, ids: list[int]) -> str:
-        return self.tk.decode(ids, skip_special_tokens=True)
+        return self.sp.decode(ids)
 
     @property
-    def vocab_size(self): return self.tk.get_vocab_size()
+    def vocab_size(self) -> int:
+        return self.sp.get_piece_size()
 
 @dataclass
 class GPTConfig:
@@ -237,13 +292,32 @@ def main():
 
     train_titles, val_titles = get_titles(args.num_titles, args.seed, args.val_frac)
     
+    # eos_token = "<eos>"
+    # tok = BPETokenizer(train_tokenizer(train_titles+val_titles, args.vocab_size, eos_token=eos_token))
+    # train_text = eos_token.join(train_titles) + eos_token
+    # val_text = eos_token.join(val_titles) + eos_token
+    # train_ids = torch.tensor(tok.encode(train_text), dtype=torch.long)
+    # val_ids = torch.tensor(tok.encode(val_text), dtype=torch.long)
     eos_token = "<eos>"
-    tok = BPETokenizer(train_tokenizer(train_titles+val_titles, args.vocab_size, eos_token=eos_token))
+
+    # Train SPM once (on train+val, like your current BPE) and load it
+    spm_prefix = f"./data/hn_spm_{args.vocab_size}"
+    spm_model_path = f"{spm_prefix}.model"
+    if not os.path.exists(spm_model_path):
+        spm_model_path = train_sentencepiece(
+            train_titles + val_titles,
+            vocab_size=args.vocab_size,
+            model_prefix=spm_prefix,
+            user_symbols=("<eos>", "<pad>"),  # keep your existing <eos> workflow
+        )
+    tok = SPMTokenizer(spm_model_path)
+
+    # Keep your existing concatenation strategy
     train_text = eos_token.join(train_titles) + eos_token
-    val_text = eos_token.join(val_titles) + eos_token
+    val_text   = eos_token.join(val_titles) + eos_token
     train_ids = torch.tensor(tok.encode(train_text), dtype=torch.long)
-    val_ids = torch.tensor(tok.encode(val_text), dtype=torch.long)
-    
+    val_ids   = torch.tensor(tok.encode(val_text), dtype=torch.long)
+
     batches = len(train_ids) // (args.block_size * args.batch_size)
     max_steps = args.epochs * batches
     eval_interval = batches // args.evals_per_epoch

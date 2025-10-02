@@ -25,7 +25,6 @@ class Hyperparameters:
     dropout: float = 0.1
     # lr: float = 6e-3
     lr: float = 1e-3 # CHANGED
-    # lr: float = 5e-4 # CHANGED 2
     # weight_decay: float = 0.00
     weight_decay: float = 0.01 # CHANGED
     evals_per_epoch: int = 3
@@ -269,8 +268,8 @@ def main():
     
     # opt = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay) # CHANGED
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=batches, T_mult=2) # CHANGED
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=batches, T_mult=2) # CHANGED
 
     def evaluate():
         model.eval()
