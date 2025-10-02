@@ -17,8 +17,8 @@ class Hyperparameters:
     block_size: int = 128
     # block_size: int = 256 # CHANGED
     batch_size: int = 64
-    vocab_size: int = 16_000
-    # vocab_size: int = 32_000 # CHANGED
+    # vocab_size: int = 16_000
+    vocab_size: int = 32_000 # CHANGED
     n_layer: int = 6
     n_head: int = 8
     d_model: int = 512
