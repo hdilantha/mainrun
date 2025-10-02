@@ -16,6 +16,35 @@ import sentencepiece as spm
 import os
 
 
+import re
+import unicodedata
+
+# Map smart punctuation to ASCII
+SMARTS = {
+    "\u2018": "'", "\u2019": "'",
+    "\u201C": '"', "\u201D": '"',
+    "\u2013": "-", "\u2014": "-",
+    "\u00A0": " ",
+}
+SMART_RE = re.compile("|".join(map(re.escape, SMARTS.keys())))
+
+ASK_RE  = re.compile(r"^\s*Ask HN:\s*",  flags=re.IGNORECASE)
+SHOW_RE = re.compile(r"^\s*Show HN:\s*", flags=re.IGNORECASE)
+TELL_RE = re.compile(r"^\s*Tell HN:\s*", flags=re.IGNORECASE)
+URL_RE  = re.compile(r"https?://\S+")
+
+def preprocess_title(t: str) -> str:
+    if not t: return ""
+    t = unicodedata.normalize("NFKC", t)
+    t = SMART_RE.sub(lambda m: SMARTS[m.group(0)], t)
+    t = URL_RE.sub("<URL>", t)
+    if ASK_RE.match(t):  t = ASK_RE.sub("<ASK> ", t)
+    if SHOW_RE.match(t): t = SHOW_RE.sub("<SHOW> ", t)
+    if TELL_RE.match(t): t = TELL_RE.sub("<TELL> ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 @dataclass
 class Hyperparameters:
     # block_size: int = 128
@@ -135,19 +164,22 @@ def iter_full_split(split_ids: torch.Tensor, block_size: int, batch_size: int, d
 #     def vocab_size(self): return self.tk.get_vocab_size()
 
 def train_sentencepiece(titles: list[str], vocab_size: int,
-                        model_prefix: str,
-                        user_symbols: tuple[str, ...] = ("<eos>", "<pad>")) -> str:
-    """
-    Trains a SentencePiece Unigram model on the given titles and writes
-    {model_prefix}.model / {model_prefix}.vocab. Returns the .model path.
-    """
+                        model_prefix: str) -> str:
+    import os
     os.makedirs(os.path.dirname(model_prefix), exist_ok=True)
     tmp_txt = f"{model_prefix}.train.txt"
     with open(tmp_txt, "w", encoding="utf-8") as f:
         for t in titles:
-            t = (t or "").strip()
-            if t:
-                f.write(t + "\n")
+            tt = preprocess_title((t or "").strip())
+            if tt:
+                f.write(tt + "\n")
+
+    # Domain/user-defined tokens that frequently appear in HN titles
+    user_syms = (
+        "<eos>", "<pad>", "<ASK>", "<SHOW>", "<TELL>", "<URL>",
+        "C++", "C#", "API", "HTTP", "HTTPS", "SQL", "NoSQL",
+        "GPU", "CLI", "macOS", "iOS", "YC", "GPT-4", "GPT-4o"
+    )
 
     spm.SentencePieceTrainer.train(
         input=tmp_txt,
@@ -158,25 +190,31 @@ def train_sentencepiece(titles: list[str], vocab_size: int,
         normalization_rule_name="nfkc",
         byte_fallback=True,
         remove_extra_whitespaces=True,
-        split_by_number=False,
-        user_defined_symbols=",".join(user_symbols),
-        hard_vocab_limit=False,  # don’t fail if user symbols push over vocab
+        split_by_number=False,          # keep 2024 / versions tighter
+        hard_vocab_limit=False,
+        user_defined_symbols=",".join(user_syms),
+        input_sentence_size=4000000,    # sample plenty
+        shuffle_input_sentence=True,
+        num_threads=0                   # use all cores
     )
     return f"{model_prefix}.model"
 
 
-class SPMTokenizer:
-    """Minimal wrapper to match your BPETokenizer interface (encode/decode/vocab_size)."""
-    def __init__(self, model_file: str):
-        self.sp = spm.SentencePieceProcessor()
-        ok = self.sp.load(model_file)
-        if not ok:
-            raise RuntimeError(f"Failed to load SentencePiece model: {model_file}")
 
-    def encode(self, s: str) -> list[int]:
-        # You already insert the literal "<eos>" string in your data;
-        # we included "<eos>" as a user-defined symbol so it is 1 token.
-        return self.sp.encode(s, out_type=int)
+class SPMTokenizer:
+    def __init__(self, model_file: str):
+        import sentencepiece as spm
+        self.sp = spm.SentencePieceProcessor()
+        if not self.sp.load(model_file):
+            raise RuntimeError(f"Failed to load SentencePiece model: {model_file}")
+        self.eos_id = self.sp.piece_to_id("<eos>")
+        assert self.eos_id != self.sp.unk_id(), "<eos> must be in vocab"
+
+    def encode_ids(self, text: str, sampling: bool = False, alpha: float = 0.1, nbest: int = -1) -> list[int]:
+        if sampling:
+            return self.sp.encode(text, out_type=int, enable_sampling=True, alpha=alpha, nbest_size=nbest)
+        else:
+            return self.sp.encode(text, out_type=int)
 
     def decode(self, ids: list[int]) -> str:
         return self.sp.decode(ids)
@@ -184,6 +222,19 @@ class SPMTokenizer:
     @property
     def vocab_size(self) -> int:
         return self.sp.get_piece_size()
+
+
+def encode_titles_to_flat_ids(titles: list[str], tok: SPMTokenizer,
+                              sampling: bool, alpha: float) -> torch.LongTensor:
+    out = []
+    for t in titles:
+        tt = preprocess_title(t)
+        if not tt: 
+            continue
+        out.extend(tok.encode_ids(tt, sampling=sampling, alpha=alpha, nbest=-1))
+        out.append(tok.eos_id)  # boundary
+    return torch.tensor(out, dtype=torch.long)
+
 
 @dataclass
 class GPTConfig:
@@ -299,24 +350,16 @@ def main():
     # train_ids = torch.tensor(tok.encode(train_text), dtype=torch.long)
     # val_ids = torch.tensor(tok.encode(val_text), dtype=torch.long)
     eos_token = "<eos>"
-
-    # Train SPM once (on train+val, like your current BPE) and load it
     spm_prefix = f"./data/hn_spm_{args.vocab_size}"
     spm_model_path = f"{spm_prefix}.model"
     if not os.path.exists(spm_model_path):
-        spm_model_path = train_sentencepiece(
-            train_titles + val_titles,
-            vocab_size=args.vocab_size,
-            model_prefix=spm_prefix,
-            user_symbols=("<eos>", "<pad>"),  # keep your existing <eos> workflow
-        )
+        spm_model_path = train_sentencepiece(train_titles + val_titles, args.vocab_size, spm_prefix)
+
     tok = SPMTokenizer(spm_model_path)
 
-    # Keep your existing concatenation strategy
-    train_text = eos_token.join(train_titles) + eos_token
-    val_text   = eos_token.join(val_titles) + eos_token
-    train_ids = torch.tensor(tok.encode(train_text), dtype=torch.long)
-    val_ids   = torch.tensor(tok.encode(val_text), dtype=torch.long)
+    # Train = sampling on (subword regularization); Val = deterministic
+    train_ids = encode_titles_to_flat_ids(train_titles, tok, sampling=True,  alpha=0.1)
+    val_ids   = encode_titles_to_flat_ids(val_titles,   tok, sampling=False, alpha=0.0)
 
     batches = len(train_ids) // (args.block_size * args.batch_size)
     max_steps = args.epochs * batches
