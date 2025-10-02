@@ -14,12 +14,11 @@ import structlog
 
 @dataclass
 class Hyperparameters:
-    block_size: int = 128
-    # block_size: int = 256 # CHANGED
+    # block_size: int = 128
+    block_size: int = 256 # CHANGED
     batch_size: int = 64
     # vocab_size: int = 16_000
-    # vocab_size: int = 32_000 # CHANGED
-    vocab_size: int = 64_000 # CHANGED
+    vocab_size: int = 32_000 # CHANGED
     n_layer: int = 6
     n_head: int = 8
     d_model: int = 512
@@ -116,6 +115,32 @@ def train_tokenizer(titles: list[str], vocab_size: int, unk_token: str = "<unk>"
     tokenizer.train_from_iterator(titles, trainer)
     return tokenizer
 
+def precompute_rope_cos_sin(seq_len: int, dim: int, device, base: int = 10000):
+    assert dim % 2 == 0, "head_dim must be even for RoPE"
+    half = dim // 2
+    inv_freq = 1.0 / (base ** (torch.arange(0, half, device=device, dtype=torch.float32) / half))
+    t = torch.arange(seq_len, device=device, dtype=torch.float32)
+    freqs = torch.einsum('t,f->tf', t, inv_freq)  # (T, half)
+
+    # shape as (1,1,T,half) to broadcast over (B,H,T,half)
+    cos = torch.cos(freqs).unsqueeze(0).unsqueeze(0)  # (1,1,T,half)
+    sin = torch.sin(freqs).unsqueeze(0).unsqueeze(0)  # (1,1,T,half)
+    return cos, sin
+
+def apply_rope(x, cos, sin):
+    # x: (B, H, T, D) with D even
+    B, H, T, D = x.shape
+    half = D // 2
+    x1, x2 = x[..., :half], x[..., half:]               # (B,H,T,half)
+
+    # Cos/sin already (1,1,T,half); just trim to T
+    cosT = cos[..., :T, :]                              # (1,1,T,half)
+    sinT = sin[..., :T, :]                              # (1,1,T,half)
+
+    xr_first  = x1 * cosT - x2 * sinT                   # (B,H,T,half)
+    xr_second = x1 * sinT + x2 * cosT                   # (B,H,T,half)
+    return torch.cat([xr_first, xr_second], dim=-1)     # (B,H,T,D)
+
 class BPETokenizer:
     def __init__(self, tokenizer: Tokenizer):
         self.tk = tokenizer
@@ -131,6 +156,17 @@ class BPETokenizer:
     @property
     def vocab_size(self): return self.tk.get_vocab_size()
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        # x: (B, T, C)
+        norm = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return self.weight * (x * norm)
+
 @dataclass
 class GPTConfig:
     vocab_size: int
@@ -140,59 +176,145 @@ class GPTConfig:
     d_model: int
     dropout: float
 
+# class CausalSelfAttention(nn.Module):
+#     def __init__(self, cfg: GPTConfig):
+#         super().__init__()
+#         assert cfg.d_model % cfg.n_head == 0
+#         self.head_dim = cfg.d_model // cfg.n_head
+#         self.n_head   = cfg.n_head
+#         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
+#         self.proj = nn.Linear(cfg.d_model, cfg.d_model)
+#         self.attn_drop = nn.Dropout(cfg.dropout)
+#         self.resid_drop= nn.Dropout(cfg.dropout)
+#         self.register_buffer("tril", torch.tril(torch.ones(cfg.block_size, cfg.block_size)))
+
+#     def forward(self, x: torch.Tensor):
+#         B, T, C = x.size()
+#         qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim).transpose(1, 3)
+#         q, k, v = qkv[..., 0, :, :], qkv[..., 1, :, :], qkv[..., 2, :, :]
+#         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+#         att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+#         att = F.softmax(att, dim=-1)
+#         att = self.attn_drop(att)
+#         y = att @ v
+#         y = y.transpose(1, 2).contiguous().view(B, T, C)
+#         return self.resid_drop(self.proj(y))
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         assert cfg.d_model % cfg.n_head == 0
         self.head_dim = cfg.d_model // cfg.n_head
         self.n_head   = cfg.n_head
-        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
-        self.proj = nn.Linear(cfg.d_model, cfg.d_model)
+        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
+        self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.attn_drop = nn.Dropout(cfg.dropout)
         self.resid_drop= nn.Dropout(cfg.dropout)
-        self.register_buffer("tril", torch.tril(torch.ones(cfg.block_size, cfg.block_size)))
+        self.rope_base = 10000
+        self.register_buffer("_rope_cos", None, persistent=False)
+        self.register_buffer("_rope_sin", None, persistent=False)
+
+    def _maybe_build_rope(self, T: int, device):
+        if (self._rope_cos is None) or (self._rope_cos.size(2) < T):
+            cos, sin = precompute_rope_cos_sin(T, self.head_dim, device, base=self.rope_base)
+            # keep buffers in fp32 is fine; if using AMP, you can cast at use-site:
+            self._rope_cos, self._rope_sin = cos, sin
+
 
     def forward(self, x: torch.Tensor):
         B, T, C = x.size()
-        qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim).transpose(1, 3)
-        q, k, v = qkv[..., 0, :, :], qkv[..., 1, :, :], qkv[..., 2, :, :]
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_drop(self.proj(y))
+        self._maybe_build_rope(T, x.device)
 
-class MLP(nn.Module):
+        # qkv: (B,T,3C) -> (B,T,3,H,D)
+        qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim)
+        # take slices on the 3-axis, then permute to (B,H,T,D)
+        q = qkv[:, :, 0].permute(0, 2, 1, 3).contiguous()  # (B,H,T,D)
+        k = qkv[:, :, 1].permute(0, 2, 1, 3).contiguous()  # (B,H,T,D)
+        v = qkv[:, :, 2].permute(0, 2, 1, 3).contiguous()  # (B,H,T,D)
+
+        # RoPE on q and k (both (B,H,T,D))
+        q = apply_rope(q, self._rope_cos, self._rope_sin)
+        k = apply_rope(k, self._rope_cos, self._rope_sin)
+
+        # scaled_dot_product_attention expects (B*H,T,D)
+        qh = q.reshape(B * self.n_head, T, self.head_dim)
+        kh = k.reshape(B * self.n_head, T, self.head_dim)
+        vh = v.reshape(B * self.n_head, T, self.head_dim)
+
+        att_out = F.scaled_dot_product_attention(
+            qh, kh, vh,
+            attn_mask=None,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            is_causal=True,
+        )  # (B*H,T,D)
+
+        att_out = att_out.reshape(B, self.n_head, T, self.head_dim).transpose(1, 2).contiguous().view(B, T, C)
+        return self.resid_drop(self.proj(att_out))
+
+# class MLP(nn.Module):
+#     def __init__(self, cfg: GPTConfig):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(cfg.d_model, 4 * cfg.d_model),
+#             nn.GELU(),
+#             nn.Linear(4 * cfg.d_model, cfg.d_model),
+#             nn.Dropout(cfg.dropout),
+#         )
+#     def forward(self, x): return self.net(x)
+
+class SwiGLU(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(cfg.d_model, 4 * cfg.d_model),
-            nn.GELU(),
-            nn.Linear(4 * cfg.d_model, cfg.d_model),
-            nn.Dropout(cfg.dropout),
-        )
-    def forward(self, x): return self.net(x)
+        # Use ~4x d_model capacity via gated path: 2*hidden because gate+value
+        hidden = int(2.6667 * cfg.d_model)  # ~= 8/3 d_model (common in LLaMA-ish stacks)
+        self.w = nn.Linear(cfg.d_model, hidden, bias=False)
+        self.v = nn.Linear(cfg.d_model, hidden, bias=False)
+        self.proj = nn.Linear(hidden, cfg.d_model, bias=False)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, x):
+        # SiLU gate * value
+        x = F.silu(self.w(x)) * self.v(x)
+        x = self.proj(x)
+        return self.drop(x)
+
+# class Block(nn.Module):
+#     def __init__(self, cfg: GPTConfig):
+#         super().__init__()
+#         self.ln1 = nn.LayerNorm(cfg.d_model)
+#         self.ln2 = nn.LayerNorm(cfg.d_model)
+#         self.attn = CausalSelfAttention(cfg)
+#         self.mlp  = MLP(cfg)
+#     def forward(self, x):
+#         x = x + self.attn(self.ln1(x))
+#         x = x + self.mlp(self.ln2(x))
+#         return x
 
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.d_model)
-        self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.ln1 = nn.RMSNorm(cfg.d_model)
+        self.ln2 = nn.RMSNorm(cfg.d_model)
         self.attn = CausalSelfAttention(cfg)
-        self.mlp  = MLP(cfg)
+        # self.mlp  = MLP(cfg)
+        self.mlp  = SwiGLU(cfg)
+    # def forward(self, x):
+    #     x = x + self.attn(self.ln1(x))
+    #     x = x + self.mlp(self.ln2(x))
+    #     return x
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
-        return x
+        y = self.ln1(x)
+        a = self.attn(y)
+        m = self.mlp(self.ln2(x))  # parallel path from x (NeoX pattern)
+        return x + a + m
 
 class GPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.cfg = cfg
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.pos_emb   = nn.Parameter(torch.zeros(1, cfg.block_size, cfg.d_model))
+        # self.pos_emb   = nn.Parameter(torch.zeros(1, cfg.block_size, cfg.d_model))
+        self.emb_scale = cfg.d_model ** -0.5
         self.drop      = nn.Dropout(cfg.dropout)
         self.blocks    = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
         self.ln_f      = nn.LayerNorm(cfg.d_model)
@@ -211,8 +333,10 @@ class GPT(nn.Module):
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         B, T = idx.size()
         tok = self.token_emb(idx)
-        pos = self.pos_emb[:, :T, :]
-        x = self.drop(tok + pos)
+        # pos = self.pos_emb[:, :T, :]
+        # x = self.drop(tok + pos)
+        tok = self.token_emb(idx) * self.emb_scale
+        x = self.drop(tok)
         for block in self.blocks: x = block(x)
         x = self.ln_f(x)
         logits = self.head(x)
