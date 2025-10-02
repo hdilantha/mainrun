@@ -216,8 +216,14 @@ class SPMTokenizer:
         assert self.eos_id != self.sp.unk_id(), "<eos> must be in vocab"
 
     def encode_ids(self, text: str) -> list[int]:
-        # Deterministic; no augmentation
-        return self.sp.encode(text, out_type=int)
+        return self.sp.encode(text, out_type=int)  # deterministic
+
+    def decode(self, ids: list[int]) -> str:
+        return self.sp.decode(ids)
+
+    @property
+    def vocab_size(self) -> int:
+        return int(self.sp.get_piece_size())
 
 
 def encode_titles_to_flat_ids(titles: list[str], tok: SPMTokenizer,
