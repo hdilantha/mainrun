@@ -8,24 +8,56 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from datasets import load_dataset
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+# from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 from tqdm import tqdm
 import structlog
 
+import sentencepiece as spm
+import os
+
+
+import re
+import unicodedata
+
+# Map smart punctuation to ASCII
+SMARTS = {
+    "\u2018": "'", "\u2019": "'",
+    "\u201C": '"', "\u201D": '"',
+    "\u2013": "-", "\u2014": "-",
+    "\u00A0": " ",
+}
+SMART_RE = re.compile("|".join(map(re.escape, SMARTS.keys())))
+
+ASK_RE  = re.compile(r"^\s*Ask HN:\s*",  flags=re.IGNORECASE)
+SHOW_RE = re.compile(r"^\s*Show HN:\s*", flags=re.IGNORECASE)
+TELL_RE = re.compile(r"^\s*Tell HN:\s*", flags=re.IGNORECASE)
+URL_RE  = re.compile(r"https?://\S+")
+
+def preprocess_title(t: str) -> str:
+    if not t: return ""
+    t = unicodedata.normalize("NFKC", t)
+    t = SMART_RE.sub(lambda m: SMARTS[m.group(0)], t)
+    t = URL_RE.sub("<URL>", t)
+    if ASK_RE.match(t):  t = ASK_RE.sub("<ASK> ", t)
+    if SHOW_RE.match(t): t = SHOW_RE.sub("<SHOW> ", t)
+    if TELL_RE.match(t): t = TELL_RE.sub("<TELL> ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 @dataclass
 class Hyperparameters:
-    block_size: int = 128
-    # block_size: int = 256 # CHANGED
+    # block_size: int = 128
+    block_size: int = 256 # CHANGED
     batch_size: int = 64
     # vocab_size: int = 16_000
-    # vocab_size: int = 32_000 # CHANGED
-    vocab_size: int = 64_000 # CHANGED
+    vocab_size: int = 32_000 # CHANGED
     n_layer: int = 6
     n_head: int = 8
     d_model: int = 512
     dropout: float = 0.1
-    # lr: float = 6e-3
-    lr: float = 1e-3 # CHANGED
+    lr: float = 6e-3
+    # lr: float = 1e-3 # CHANGED
     # weight_decay: float = 0.00
     weight_decay: float = 0.01 # CHANGED
     evals_per_epoch: int = 3
@@ -105,31 +137,106 @@ def iter_full_split(split_ids: torch.Tensor, block_size: int, batch_size: int, d
         y = batch[1:].view(batch_size, block_size).to(device)
         yield x, y
 
-def train_tokenizer(titles: list[str], vocab_size: int, unk_token: str = "<unk>", pad_token: str = "<pad>", eos_token: str = "<eos>") -> Tokenizer:
-    tokenizer = Tokenizer(models.BPE(unk_token=unk_token))
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
-    tokenizer.decoder = decoders.ByteLevel()
-    trainer = trainers.BpeTrainer(
-        vocab_size=vocab_size,
-        special_tokens=[pad_token, eos_token, unk_token]
+# def train_tokenizer(titles: list[str], vocab_size: int, unk_token: str = "<unk>", pad_token: str = "<pad>", eos_token: str = "<eos>") -> Tokenizer:
+#     tokenizer = Tokenizer(models.BPE(unk_token=unk_token))
+#     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
+#     tokenizer.decoder = decoders.ByteLevel()
+#     trainer = trainers.BpeTrainer(
+#         vocab_size=vocab_size,
+#         special_tokens=[pad_token, eos_token, unk_token]
+#     )
+#     tokenizer.train_from_iterator(titles, trainer)
+#     return tokenizer
+
+# class BPETokenizer:
+#     def __init__(self, tokenizer: Tokenizer):
+#         self.tk = tokenizer
+#         self.stoi = {tok: i for tok, i in tokenizer.get_vocab().items()}
+#         self.itos = {i: tok for tok, i in tokenizer.get_vocab().items()}
+
+#     def encode(self, s: str) -> list[int]:
+#         return self.tk.encode(s).ids
+
+#     def decode(self, ids: list[int]) -> str:
+#         return self.tk.decode(ids, skip_special_tokens=True)
+
+#     @property
+#     def vocab_size(self): return self.tk.get_vocab_size()
+
+def train_sentencepiece(titles: list[str], vocab_size: int, model_prefix: str) -> str:
+    import os, sentencepiece as spm
+    os.makedirs(os.path.dirname(model_prefix), exist_ok=True)
+    tmp_txt = f"{model_prefix}.train.txt"
+    with open(tmp_txt, "w", encoding="utf-8") as f:
+        for t in titles:
+            tt = (t or "").strip()
+            if tt:
+                f.write(tt + "\n")
+
+    # URL/techy fragments commonly found in HN titles.
+    # (No spaces; these match verbatim substrings in your raw data.)
+    user_syms = (
+        "<eos>", "<pad>",
+        "http", "https", "://", "www.", ".com", ".org", ".io",
+        ".dev", ".ai", ".net", ".gg",
+        "C++", "C#", "API", "SDK", "GPU", "CLI",
+        "HTTP", "HTTPS", "SQL", "NoSQL",
+        "macOS", "iOS", "Android", "Linux", "Unix",
+        "RFC", "YC", "OSS",
+        "GPT-4", "GPT-4o", "LLM", "AI"
     )
-    tokenizer.train_from_iterator(titles, trainer)
-    return tokenizer
 
-class BPETokenizer:
-    def __init__(self, tokenizer: Tokenizer):
-        self.tk = tokenizer
-        self.stoi = {tok: i for tok, i in tokenizer.get_vocab().items()}
-        self.itos = {i: tok for tok, i in tokenizer.get_vocab().items()}
+    spm.SentencePieceTrainer.train(
+        input=tmp_txt,
+        model_prefix=model_prefix,
+        model_type="unigram",
+        vocab_size=vocab_size,
+        character_coverage=1.0,
+        normalization_rule_name="nfkc",  # safe normalization, not augmentation
+        byte_fallback=True,
+        remove_extra_whitespaces=True,
+        split_by_number=False,           # keep 2024 / 1.2.3 tighter
+        hard_vocab_limit=False,
+        user_defined_symbols=",".join(user_syms),
+        input_sentence_size=4000000,
+        shuffle_input_sentence=True,
+        num_threads=0
+    )
+    return f"{model_prefix}.model"
 
-    def encode(self, s: str) -> list[int]:
-        return self.tk.encode(s).ids
+
+
+class SPMTokenizer:
+    def __init__(self, model_file: str):
+        import sentencepiece as spm
+        self.sp = spm.SentencePieceProcessor()
+        if not self.sp.load(model_file):
+            raise RuntimeError(f"Failed to load SentencePiece model: {model_file}")
+        self.eos_id = self.sp.piece_to_id("<eos>")
+        assert self.eos_id != self.sp.unk_id(), "<eos> must be in vocab"
+
+    def encode_ids(self, text: str) -> list[int]:
+        return self.sp.encode(text, out_type=int)  # deterministic
 
     def decode(self, ids: list[int]) -> str:
-        return self.tk.decode(ids, skip_special_tokens=True)
+        return self.sp.decode(ids)
 
     @property
-    def vocab_size(self): return self.tk.get_vocab_size()
+    def vocab_size(self) -> int:
+        return int(self.sp.get_piece_size())
+
+
+def encode_titles_to_flat_ids(titles: list[str], tok: SPMTokenizer,
+                              sampling: bool, alpha: float) -> torch.LongTensor:
+    out = []
+    for t in titles:
+        tt = preprocess_title(t)
+        if not tt: 
+            continue
+        out.extend(tok.encode_ids(tt, sampling=sampling, alpha=alpha, nbest=-1))
+        out.append(tok.eos_id)  # boundary
+    return torch.tensor(out, dtype=torch.long)
+
 
 @dataclass
 class GPTConfig:
@@ -238,13 +345,25 @@ def main():
 
     train_titles, val_titles = get_titles(args.num_titles, args.seed, args.val_frac)
     
+    # eos_token = "<eos>"
+    # tok = BPETokenizer(train_tokenizer(train_titles+val_titles, args.vocab_size, eos_token=eos_token))
+    # train_text = eos_token.join(train_titles) + eos_token
+    # val_text = eos_token.join(val_titles) + eos_token
+    # train_ids = torch.tensor(tok.encode(train_text), dtype=torch.long)
+    # val_ids = torch.tensor(tok.encode(val_text), dtype=torch.long)
     eos_token = "<eos>"
-    tok = BPETokenizer(train_tokenizer(train_titles+val_titles, args.vocab_size, eos_token=eos_token))
+    spm_prefix = f"./data/hn_spm_{args.vocab_size}"
+    spm_model_path = f"{spm_prefix}.model"
+    if not os.path.exists(spm_model_path):
+        spm_model_path = train_sentencepiece(train_titles + val_titles, args.vocab_size, spm_prefix)
+
+    tok = SPMTokenizer(spm_model_path)
+
     train_text = eos_token.join(train_titles) + eos_token
-    val_text = eos_token.join(val_titles) + eos_token
-    train_ids = torch.tensor(tok.encode(train_text), dtype=torch.long)
-    val_ids = torch.tensor(tok.encode(val_text), dtype=torch.long)
-    
+    val_text   = eos_token.join(val_titles) + eos_token
+    train_ids  = torch.tensor(tok.encode_ids(train_text), dtype=torch.long)
+    val_ids    = torch.tensor(tok.encode_ids(val_text),   dtype=torch.long)
+
     batches = len(train_ids) // (args.block_size * args.batch_size)
     max_steps = args.epochs * batches
     eval_interval = batches // args.evals_per_epoch
