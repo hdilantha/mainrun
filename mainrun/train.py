@@ -20,8 +20,10 @@ class Hyperparameters:
     # vocab_size: int = 16_000
     vocab_size: int = 32_000 # CHANGED
     n_layer: int = 6
-    n_head: int = 8
-    d_model: int = 512
+    # n_head: int = 8
+    n_head: int = 12 # CHANGED
+    # d_model: int = 512
+    d_model: int = 768 # CHANGED
     dropout: float = 0.1
     # lr: float = 6e-3
     lr: float = 1e-3 # CHANGED
