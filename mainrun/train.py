@@ -14,21 +14,15 @@ import structlog
 
 @dataclass
 class Hyperparameters:
-    block_size: int = 128
-    # block_size: int = 256 # CHANGED
+    block_size: int = 256 # [Rec. 1]
     batch_size: int = 64
-    vocab_size: int = 16_000
-    # vocab_size: int = 32_000 # CHANGED
+    vocab_size: int = 32_000 # [Rec. 3]
     n_layer: int = 6
     n_head: int = 8
-    # n_head: int = 12 # CHANGED
     d_model: int = 512
-    # d_model: int = 768 # CHANGED
     dropout: float = 0.1
-    # lr: float = 6e-3
-    lr: float = 1e-3 # CHANGED
-    # weight_decay: float = 0.00
-    weight_decay: float = 0.01 # CHANGED
+    lr: float = 1e-3 # [Rec. 1]
+    weight_decay: float = 0.01 # [Rec. 1]
     evals_per_epoch: int = 3
     
     epochs: int = 7
@@ -117,16 +111,17 @@ def train_tokenizer(titles: list[str], vocab_size: int, unk_token: str = "<unk>"
     tokenizer.train_from_iterator(titles, trainer)
     return tokenizer
 
+# Recommendation 4.2 ====================================================================================================
+
 def precompute_rope_cos_sin(seq_len: int, dim: int, device, base: int = 10000):
     assert dim % 2 == 0, "head_dim must be even for RoPE"
     half = dim // 2
     inv_freq = 1.0 / (base ** (torch.arange(0, half, device=device, dtype=torch.float32) / half))
     t = torch.arange(seq_len, device=device, dtype=torch.float32)
-    freqs = torch.einsum('t,f->tf', t, inv_freq)  # (T, half)
+    freqs = torch.einsum('t,f->tf', t, inv_freq) 
 
-    # shape as (1,1,T,half) to broadcast over (B,H,T,half)
-    cos = torch.cos(freqs).unsqueeze(0).unsqueeze(0)  # (1,1,T,half)
-    sin = torch.sin(freqs).unsqueeze(0).unsqueeze(0)  # (1,1,T,half)
+    cos = torch.cos(freqs).unsqueeze(0).unsqueeze(0)  
+    sin = torch.sin(freqs).unsqueeze(0).unsqueeze(0)  
     return cos, sin
 
 def apply_rope(x, cos, sin):
@@ -142,6 +137,8 @@ def apply_rope(x, cos, sin):
     xr_first  = x1 * cosT - x2 * sinT                   # (B,H,T,half)
     xr_second = x1 * sinT + x2 * cosT                   # (B,H,T,half)
     return torch.cat([xr_first, xr_second], dim=-1)     # (B,H,T,D)
+
+# =======================================================================================================================
 
 class BPETokenizer:
     def __init__(self, tokenizer: Tokenizer):
@@ -178,29 +175,7 @@ class GPTConfig:
     d_model: int
     dropout: float
 
-# class CausalSelfAttention(nn.Module):
-#     def __init__(self, cfg: GPTConfig):
-#         super().__init__()
-#         assert cfg.d_model % cfg.n_head == 0
-#         self.head_dim = cfg.d_model // cfg.n_head
-#         self.n_head   = cfg.n_head
-#         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
-#         self.proj = nn.Linear(cfg.d_model, cfg.d_model)
-#         self.attn_drop = nn.Dropout(cfg.dropout)
-#         self.resid_drop= nn.Dropout(cfg.dropout)
-#         self.register_buffer("tril", torch.tril(torch.ones(cfg.block_size, cfg.block_size)))
-
-#     def forward(self, x: torch.Tensor):
-#         B, T, C = x.size()
-#         qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim).transpose(1, 3)
-#         q, k, v = qkv[..., 0, :, :], qkv[..., 1, :, :], qkv[..., 2, :, :]
-#         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-#         att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-#         att = F.softmax(att, dim=-1)
-#         att = self.attn_drop(att)
-#         y = att @ v
-#         y = y.transpose(1, 2).contiguous().view(B, T, C)
-#         return self.resid_drop(self.proj(y))
+# Recommendation 4.2 ====================================================================================================
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: GPTConfig):
@@ -253,16 +228,9 @@ class CausalSelfAttention(nn.Module):
         att_out = att_out.reshape(B, self.n_head, T, self.head_dim).transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.proj(att_out))
 
-# class MLP(nn.Module):
-#     def __init__(self, cfg: GPTConfig):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(cfg.d_model, 4 * cfg.d_model),
-#             nn.GELU(),
-#             nn.Linear(4 * cfg.d_model, cfg.d_model),
-#             nn.Dropout(cfg.dropout),
-#         )
-#     def forward(self, x): return self.net(x)
+# =======================================================================================================================
+
+# Recommendation 4.3 ====================================================================================================
 
 class SwiGLU(nn.Module):
     def __init__(self, cfg: GPTConfig):
@@ -280,34 +248,19 @@ class SwiGLU(nn.Module):
         x = self.proj(x)
         return self.drop(x)
 
-# class Block(nn.Module):
-#     def __init__(self, cfg: GPTConfig):
-#         super().__init__()
-#         self.ln1 = nn.LayerNorm(cfg.d_model)
-#         self.ln2 = nn.LayerNorm(cfg.d_model)
-#         self.attn = CausalSelfAttention(cfg)
-#         self.mlp  = MLP(cfg)
-#     def forward(self, x):
-#         x = x + self.attn(self.ln1(x))
-#         x = x + self.mlp(self.ln2(x))
-#         return x
+# =======================================================================================================================
 
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.ln1 = nn.RMSNorm(cfg.d_model)
-        self.ln2 = nn.RMSNorm(cfg.d_model)
+        self.ln1 = nn.RMSNorm(cfg.d_model) # Switched to RMSNorm [Rec. 4.1]
+        self.ln2 = nn.RMSNorm(cfg.d_model) # Switched to RMSNorm [Rec. 4.1]
         self.attn = CausalSelfAttention(cfg)
-        # self.mlp  = MLP(cfg)
-        self.mlp  = SwiGLU(cfg)
-    # def forward(self, x):
-    #     x = x + self.attn(self.ln1(x))
-    #     x = x + self.mlp(self.ln2(x))
-    #     return x
+        self.mlp  = SwiGLU(cfg) # Switched to SwiGLU [Rec. 4.3]
     def forward(self, x):
         y = self.ln1(x)
         a = self.attn(y)
-        m = self.mlp(self.ln2(x))  # parallel path from x (NeoX pattern)
+        m = self.mlp(self.ln2(x))  # Parallel path from x (NeoX pattern) [Rec. 4.4]
         return x + a + m
 
 class GPT(nn.Module):
@@ -315,8 +268,7 @@ class GPT(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        # self.pos_emb   = nn.Parameter(torch.zeros(1, cfg.block_size, cfg.d_model))
-        self.emb_scale = cfg.d_model ** -0.5
+        self.emb_scale = cfg.d_model ** -0.5 # Embed Scaling [Rec. 4.2]
         self.drop      = nn.Dropout(cfg.dropout)
         self.blocks    = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
         self.ln_f      = nn.LayerNorm(cfg.d_model)
@@ -335,8 +287,6 @@ class GPT(nn.Module):
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         B, T = idx.size()
         tok = self.token_emb(idx)
-        # pos = self.pos_emb[:, :T, :]
-        # x = self.drop(tok + pos)
         tok = self.token_emb(idx) * self.emb_scale
         x = self.drop(tok)
         for block in self.blocks: x = block(x)
@@ -393,10 +343,8 @@ def main():
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log("model_info", parameters_count=model_params)
     
-    # opt = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay) # CHANGED
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay) # Switched to AdamW [Rec. 1]
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=batches, T_mult=2) # CHANGED
 
     def evaluate():
         model.eval()
