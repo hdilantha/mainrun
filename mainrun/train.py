@@ -14,15 +14,15 @@ import structlog
 
 @dataclass
 class Hyperparameters:
-    block_size: int = 256 # [Rec. 1]
+    block_size: int = 256 # Increase from 128 [Rec. 1]
     batch_size: int = 64
-    vocab_size: int = 32_000 # [Rec. 3]
+    vocab_size: int = 32_000 # Increase from 16_000 [Rec. 3]
     n_layer: int = 6
     n_head: int = 8
     d_model: int = 512
     dropout: float = 0.1
-    lr: float = 1e-3 # [Rec. 1]
-    weight_decay: float = 0.01 # [Rec. 1]
+    lr: float = 1e-3 # Decrease from 6e-3 [Rec. 1]
+    weight_decay: float = 0.01 # Increase from 0.0 [Rec. 1]
     evals_per_epoch: int = 3
     
     epochs: int = 7
@@ -111,9 +111,20 @@ def train_tokenizer(titles: list[str], vocab_size: int, unk_token: str = "<unk>"
     tokenizer.train_from_iterator(titles, trainer)
     return tokenizer
 
-# Recommendation 4.2 ====================================================================================================
-
 def precompute_rope_cos_sin(seq_len: int, dim: int, device, base: int = 10000):
+    """
+    Precompute rotary position embedding (RoPE) cosine and sine matrices. [Rec. 4.2]
+
+    Args:
+        seq_len (int): Maximum sequence length.
+        dim (int): Head dimension (must be even).
+        device: Torch device (e.g., 'cpu' or 'cuda').
+        base (int): RoPE frequency base (default: 10000).
+
+    Returns:
+        (cos, sin): Tensors shaped (1, 1, seq_len, dim/2) containing
+        the cosines and sines of the position-dependent rotation angles.
+    """
     assert dim % 2 == 0, "head_dim must be even for RoPE"
     half = dim // 2
     inv_freq = 1.0 / (base ** (torch.arange(0, half, device=device, dtype=torch.float32) / half))
@@ -125,6 +136,18 @@ def precompute_rope_cos_sin(seq_len: int, dim: int, device, base: int = 10000):
     return cos, sin
 
 def apply_rope(x, cos, sin):
+    """
+    Apply rotary position embeddings (RoPE) to query/key tensors. [Rec. 4.2]
+
+    Args:
+        x (Tensor): Input of shape (B, H, T, D), with D even.
+        cos (Tensor): Precomputed cos values (1, 1, T, D/2).
+        sin (Tensor): Precomputed sin values (1, 1, T, D/2).
+
+    Returns:
+        Tensor: Same shape as input (B, H, T, D), rotated in half-dim pairs
+        to encode relative positions.
+    """
     # x: (B, H, T, D) with D even
     B, H, T, D = x.shape
     half = D // 2
@@ -137,8 +160,6 @@ def apply_rope(x, cos, sin):
     xr_first  = x1 * cosT - x2 * sinT                   # (B,H,T,half)
     xr_second = x1 * sinT + x2 * cosT                   # (B,H,T,half)
     return torch.cat([xr_first, xr_second], dim=-1)     # (B,H,T,D)
-
-# =======================================================================================================================
 
 class BPETokenizer:
     def __init__(self, tokenizer: Tokenizer):
@@ -175,9 +196,16 @@ class GPTConfig:
     d_model: int
     dropout: float
 
-# Recommendation 4.2 ====================================================================================================
-
 class CausalSelfAttention(nn.Module):
+    """
+    Multi-head causal self-attention with rotary position embeddings (RoPE). [Rec. 4.2]
+
+    Splits input into query, key, and value projections, applies RoPE to encode
+    relative positions, and computes scaled dot-product attention with a causal
+    mask (no access to future tokens). Supports dropout on both attention weights
+    and residual projection. Used as the core attention block in GPT-style
+    decoder-only transformers.
+    """
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         assert cfg.d_model % cfg.n_head == 0
@@ -196,7 +224,6 @@ class CausalSelfAttention(nn.Module):
             cos, sin = precompute_rope_cos_sin(T, self.head_dim, device, base=self.rope_base)
             # keep buffers in fp32 is fine; if using AMP, you can cast at use-site:
             self._rope_cos, self._rope_sin = cos, sin
-
 
     def forward(self, x: torch.Tensor):
         B, T, C = x.size()
@@ -228,11 +255,15 @@ class CausalSelfAttention(nn.Module):
         att_out = att_out.reshape(B, self.n_head, T, self.head_dim).transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.proj(att_out))
 
-# =======================================================================================================================
-
-# Recommendation 4.3 ====================================================================================================
-
 class SwiGLU(nn.Module):
+    """
+    SwiGLU feedforward block. [Rec. 4.3]
+
+    Uses a gated linear unit with SiLU activation (SiLU(x) * Value(x)) 
+    for improved expressiveness compared to ReLU/GeLU MLPs. 
+    Expands hidden dimension to ~2.67 * d_model (≈ 8/3) and projects 
+    back to d_model. Common in LLaMA-style transformer stacks.
+    """
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         # Use ~4x d_model capacity via gated path: 2*hidden because gate+value
@@ -247,8 +278,6 @@ class SwiGLU(nn.Module):
         x = F.silu(self.w(x)) * self.v(x)
         x = self.proj(x)
         return self.drop(x)
-
-# =======================================================================================================================
 
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
